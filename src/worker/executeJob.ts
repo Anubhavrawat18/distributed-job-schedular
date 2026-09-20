@@ -25,7 +25,15 @@ const handlers: Record<string, JobHandler> = {
 // → If execution succeeds, mark the job as completed and store the result
 // → If execution fails, catch the error and mark the job as failed
 
-export async function executeJob(job: Job): Promise<void> {
+export async function executeJob(job: Job, workerId: string): Promise<void> {
+  // Append-only record of "this worker actually ran this job". Written before
+  // the handler, so a duplicate claim is recorded even if both executions end
+  // up overwriting each other's final status on the jobs row.
+  await pool.query(
+    `INSERT INTO job_executions (job_id, worker_id) VALUES ($1, $2)`,
+    [job.id, workerId],
+  );
+
   const handler = handlers[job.type];
 
   if (!handler) {

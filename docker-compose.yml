@@ -17,5 +17,19 @@ services:
       timeout: 5s
       retries: 10
 
+  # Scale with: docker compose up -d --scale worker=5
+  # No container_name here — Compose needs to generate one per replica.
+  worker:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      # Inside the Compose network Postgres is reachable by service name.
+      DATABASE_URL: postgres://scheduler:scheduler@postgres:5432/job_scheduler
+      WORKER_POLL_INTERVAL_MS: ${WORKER_POLL_INTERVAL_MS:-1000}
+      CLAIM_STRATEGY: ${CLAIM_STRATEGY:-skip_locked}
+
 volumes:
   pgdata:

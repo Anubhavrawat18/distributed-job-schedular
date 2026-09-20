@@ -7,7 +7,8 @@
     "dev:api": "ts-node-dev --respawn --transpile-only src/api/server.ts",
     "dev:worker": "ts-node-dev --respawn --transpile-only src/worker/worker.ts",
     "build": "tsc -p tsconfig.json",
-    "db:init": "ts-node src/db/init.ts"
+    "db:init": "ts-node src/db/init.ts",
+    "test:concurrency": "ts-node tests/concurrency.ts"
   },
   "dependencies": {
     "dotenv": "^16.4.5",

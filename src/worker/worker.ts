@@ -24,15 +24,17 @@ const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 let running = true;
 
+const workerId = config.worker.id;
+
 async function main(): Promise<void> {
   console.log(
-    `[worker] started, polling every ${config.worker.pollIntervalMs}ms`,
+    `[worker ${workerId}] started, polling every ${config.worker.pollIntervalMs}ms, claim strategy: ${config.worker.claimStrategy}`,
   );
 
   while (running) {
     let job;
     try {
-      job = await claimJob();
+      job = await claimJob(workerId);
     } catch (err) {
       console.error("[worker] claim failed", err);
       await sleep(config.worker.pollIntervalMs);
@@ -44,8 +46,8 @@ async function main(): Promise<void> {
       continue;
     }
 
-    console.log(`[worker] claimed job ${job.id} (${job.type})`);
-    await executeJob(job);
+    console.log(`[worker ${workerId}] claimed job ${job.id} (${job.type})`);
+    await executeJob(job, workerId);
     // Drain back-to-back without sleeping while work remains in the queue.
   }
 
