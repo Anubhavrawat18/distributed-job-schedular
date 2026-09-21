@@ -17,15 +17,21 @@ import type { Job } from "../types/job";
  * it, N workers claim N different jobs in parallel.
  *
  * LIMIT 1 sits inside the subquery, so each worker locks exactly one row.
+ *
+ * `next_run_at <= now()` is what implements retry backoff: a job waiting out
+ * its delay is simply invisible to this query until its time arrives. The
+ * attempt counter is incremented here rather than in executeJob so that it is
+ * atomic with the claim — a worker that crashes mid-job has still spent an
+ * attempt, which is what stops a poison job from being retried forever.
  */
 async function claimSkipLocked(workerId: string): Promise<Job | null> {
   const { rows } = await pool.query<Job>(
     `UPDATE jobs
-     SET status = 'running', worker_id = $1, updated_at = now()
+     SET status = 'running', worker_id = $1, attempts = attempts + 1, updated_at = now()
      WHERE id = (
        SELECT id FROM jobs
-       WHERE status = 'pending'
-       ORDER BY created_at
+       WHERE status = 'pending' AND next_run_at <= now()
+       ORDER BY next_run_at, created_at
        FOR UPDATE SKIP LOCKED
        LIMIT 1
      )
@@ -48,8 +54,8 @@ async function claimNaive(workerId: string): Promise<Job | null> {
   // select exactly one job with pending status
   const pending = await pool.query<{ id: number }>(
     `SELECT id FROM jobs
-     WHERE status = 'pending'
-     ORDER BY created_at
+     WHERE status = 'pending' AND next_run_at <= now()
+     ORDER BY next_run_at, created_at
      LIMIT 1`,
   );
 
@@ -62,7 +68,7 @@ async function claimNaive(workerId: string): Promise<Job | null> {
   // claimed more than once.
   const claimed = await pool.query<Job>(
     `UPDATE jobs
-     SET status = 'running', worker_id = $1, updated_at = now()
+     SET status = 'running', worker_id = $1, attempts = attempts + 1, updated_at = now()
      WHERE id = $2
      RETURNING *`,
     [workerId, pending.rows[0].id],

@@ -24,4 +24,10 @@ export const config = {
 
     claimStrategy,
   },
+  retry: {
+    // Default budget for a job that does not specify its own max_attempts.
+    maxAttempts: Number(process.env.RETRY_MAX_ATTEMPTS ?? 3),
+    baseMs: Number(process.env.RETRY_BASE_MS ?? 1000),
+    maxMs: Number(process.env.RETRY_MAX_MS ?? 30_000),
+  },
 };

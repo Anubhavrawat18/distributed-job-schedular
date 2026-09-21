@@ -5,6 +5,7 @@ import {
   type NextFunction,
 } from "express";
 import { pool } from "../../db/client";
+import { config } from "../../config";
 import type { Job } from "../../types/job";
 
 // Express 4 does not forward rejected promises to the error handler, so async
@@ -31,7 +32,7 @@ jobsRouter.post(
   asyncRoute(async (req, res) => {
     // Get `type` and `payload` from the request body.
     // If req.body doesn't exist, use an empty object instead.
-    const { type, payload } = req.body ?? {};
+    const { type, payload, maxAttempts } = req.body ?? {};
 
     // Make sure `type` is a string and is not empty.
     if (typeof type !== "string" || type.trim() === "") {
@@ -53,19 +54,52 @@ jobsRouter.post(
       return res.status(400).json({ error: "`payload` must be a JSON object" });
     }
 
+    // Retry budget is per job: a cheap idempotent job can afford many attempts,
+    // a payment call should get very few.
+    if (
+      maxAttempts !== undefined &&
+      (!Number.isInteger(maxAttempts) || maxAttempts < 1)
+    ) {
+      return res
+        .status(400)
+        .json({ error: "`maxAttempts` must be an integer >= 1" });
+    }
+
     // Insert the new job into the database.
-    // $1 and $2 are placeholders for the values in the array below.
+    // $1, $2, $3 are placeholders for the values in the array below.
     //
     // RETURNING * tells PostgreSQL to return the newly inserted row.
     const { rows } = await pool.query<Job>(
-      `INSERT INTO jobs (type, payload)
-             VALUES ($1, $2)
+      `INSERT INTO jobs (type, payload, max_attempts)
+             VALUES ($1, $2, COALESCE($3::int, $4::int))
              RETURNING *`,
-      [type.trim(), payload ?? {}],
+      [type.trim(), payload ?? {}, maxAttempts ?? null, config.retry.maxAttempts],
     );
 
     // Return the newly created job with HTTP 201 (Created).
     return res.status(201).json(rows[0]);
+  }),
+);
+
+// The dead-letter queue: jobs that exhausted their retry budget, newest first.
+// Registered before /jobs/:id so "dead-letter" is not parsed as an id.
+jobsRouter.get(
+  "/jobs/dead-letter",
+
+  asyncRoute(async (req, res) => {
+    const limit = Math.min(Number(req.query.limit) || 50, 200);
+
+    const { rows } = await pool.query(
+      `SELECT d.job_id, d.attempts, d.final_error, d.died_at,
+              j.type, j.payload
+       FROM dead_letter_jobs d
+       JOIN jobs j ON j.id = d.job_id
+       ORDER BY d.died_at DESC
+       LIMIT $1`,
+      [limit],
+    );
+
+    return res.json({ deadLetterJobs: rows });
   }),
 );
 

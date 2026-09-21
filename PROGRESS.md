@@ -200,3 +200,106 @@ npm run test:concurrency   # FAIL: N job(s) executed more than once
 `running` forever — nothing reclaims it. `worker_id` is the hook for that fix,
 but the lease/heartbeat logic is Phase 8. Retries (Phase 3) are also still
 missing, so a failed job remains terminal.
+
+---
+
+## Phase 3 — Retries, exponential backoff, and the dead-letter queue
+
+**What:** A failed job is no longer terminal. Jobs carry a retry budget
+(`attempts` / `max_attempts`, overridable per job at enqueue), a failed attempt
+is rescheduled with exponentially increasing delay plus jitter, and a job that
+exhausts its budget lands in a `dead_letter_jobs` table with the error that
+killed it. Adds `GET /jobs/dead-letter`.
+
+**Purpose:** Solves **transient failure**, which is the normal case in a
+distributed system rather than the exception. Networks blip, dependencies
+restart, rate limits trip. Phase 1 treated all of these as permanent and threw
+the work away. The interesting part is not "try again" — it is trying again in a
+way that does not make the original problem worse, and knowing when to stop.
+
+**How it works:**
+
+- **Backoff is a row value, not a timer.** A failed job goes back to `pending`
+  with `next_run_at = now() + delay`, and the claim query gained
+  `AND next_run_at <= now()`. A job serving its backoff is simply *invisible* to
+  workers until its time comes. This is the whole mechanism — there is no timer,
+  no sleeping worker, no in-memory delay queue. That matters because an
+  in-memory delay is lost on restart: a worker holding 50 pending retries that
+  gets redeployed drops all 50. Here a restart changes nothing, because the
+  delay was never in the process to begin with.
+
+- **The attempt counter increments at claim time**, inside the same atomic
+  `UPDATE` as the claim — not when the handler finishes. If it incremented on
+  completion, a worker that is killed mid-execution would never record the
+  attempt, and a job that reliably crashes its worker (OOM, segfault, infinite
+  loop) would be retried forever, taking down each worker that touches it in
+  turn. Charging the attempt up front means a poison job exhausts its budget and
+  dead-letters instead of becoming a fleet-wide outage.
+
+- **Jitter is the point, not a detail** (`src/retry/backoff.ts`). Exponential
+  growth alone gives every job a *deterministic* delay: if a dependency goes
+  down and 1000 jobs fail within the same second, all 1000 compute the same
+  backoff, wake at the same instant, and stampede the service the moment it
+  recovers — re-triggering the outage they were retrying because of. Jitter
+  smears the retries across a window so recovery is gradual.
+
+  The flavour here is **equal jitter** (`half + random(half)`) rather than AWS's
+  **full jitter** (`random(0, exponential)`). Full jitter spreads load marginally
+  better, but its lower bound is zero, so it can reschedule a retry almost
+  immediately and defeat the backoff entirely for an unlucky job. Equal jitter
+  guarantees a floor of `exponential / 2` while still breaking up the herd — the
+  delay is both genuinely increasing *and* spread.
+
+- **An unknown job type skips retries entirely.** Retrying cannot make a handler
+  appear, so it dead-letters on the first attempt. Distinguishing "retryable" from
+  "hopeless" is what stops the DLQ from being noise.
+
+- **The DLQ references jobs rather than moving rows into it.** The classic
+  implementation relocates the row to a separate table, but that would orphan
+  the job's `job_executions` history — precisely the forensic trail you want when
+  investigating why something died. Keeping the job in place means "what happened
+  to job 7" stays answerable, and replaying a dead job becomes an `UPDATE`
+  (reset status, clear `attempts`) instead of a migration back across tables.
+
+**Measured results** (`npm run test:retry`, 5 workers, `RETRY_BASE_MS=1000`):
+
+| Scenario | Attempts | Final state | In DLQ? |
+|---|---|---|---|
+| `flaky` job failing twice, budget 5 | 3 | `completed` | no |
+| `fail` job, budget 3 | 3 | `failed` | yes |
+| unknown job type, budget 3 | 1 | `failed` | yes |
+
+Observed gaps between attempts of the doomed job: **642ms, then 1733ms** —
+backoff visibly growing, each within its equal-jitter band (500–1000ms, then
+1000–2000ms). Across 1000 samples of attempt 3, delays spanned **2001–3998ms
+over 780 distinct values**: bounded as designed, and spread rather than
+constant.
+
+The Phase 2 concurrency test still passes unchanged (200 jobs, 200 executions,
+0 duplicates), confirming the rewritten claim query did not reopen the race.
+
+**One bug worth recording:** the enqueue query originally used
+`COALESCE($3, $4)` for the retry budget. Postgres could not infer a type for a
+`null` parameter there and rejected the statement with `42804`, but only on the
+API path — the tests insert via SQL directly and never hit it. Fixed with
+explicit `::int` casts. A reminder that parameter type inference is not
+guaranteed just because the column type is known.
+
+**Running it:**
+
+```bash
+docker compose up -d --build --scale worker=5
+npm run db:init          # adds attempts/max_attempts/next_run_at + DLQ table
+npm run test:retry
+curl localhost:3000/jobs/dead-letter
+```
+
+```bash
+curl -X POST localhost:3000/jobs -H 'content-type: application/json' \
+  -d '{"type":"flaky","payload":{"failTimes":2},"maxAttempts":5}'
+```
+
+**Still open:** replaying a dead-lettered job is a manual `UPDATE` — there is no
+endpoint for it yet. And the Phase 2 gap remains: a job whose worker dies stays
+`running` forever, since `next_run_at` only governs jobs that made it back to
+`pending`. Both the stuck-job lease and crash recovery are Phase 8.
