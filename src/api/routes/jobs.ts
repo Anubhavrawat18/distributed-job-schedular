@@ -32,7 +32,7 @@ jobsRouter.post(
   asyncRoute(async (req, res) => {
     // Get `type` and `payload` from the request body.
     // If req.body doesn't exist, use an empty object instead.
-    const { type, payload, maxAttempts } = req.body ?? {};
+    const { type, payload, maxAttempts, runAt, delaySeconds } = req.body ?? {};
 
     // Make sure `type` is a string and is not empty.
     if (typeof type !== "string" || type.trim() === "") {
@@ -65,15 +65,51 @@ jobsRouter.post(
         .json({ error: "`maxAttempts` must be an integer >= 1" });
     }
 
+    // A delayed job needs no special machinery: next_run_at already gates
+    // eligibility for retry backoff, so "run this later" is the same mechanism
+    // with a different starting value.
+    if (runAt !== undefined && delaySeconds !== undefined) {
+      return res
+        .status(400)
+        .json({ error: "provide `runAt` or `delaySeconds`, not both" });
+    }
+
+    let nextRunAt: Date | null = null;
+
+    if (runAt !== undefined) {
+      const parsed = new Date(runAt);
+      if (Number.isNaN(parsed.getTime())) {
+        return res
+          .status(400)
+          .json({ error: "`runAt` must be a valid ISO 8601 timestamp" });
+      }
+      nextRunAt = parsed;
+    }
+
+    if (delaySeconds !== undefined) {
+      if (typeof delaySeconds !== "number" || !Number.isFinite(delaySeconds) || delaySeconds < 0) {
+        return res
+          .status(400)
+          .json({ error: "`delaySeconds` must be a non-negative number" });
+      }
+      nextRunAt = new Date(Date.now() + delaySeconds * 1000);
+    }
+
     // Insert the new job into the database.
-    // $1, $2, $3 are placeholders for the values in the array below.
+    // $1..$5 are placeholders for the values in the array below.
     //
     // RETURNING * tells PostgreSQL to return the newly inserted row.
     const { rows } = await pool.query<Job>(
-      `INSERT INTO jobs (type, payload, max_attempts)
-             VALUES ($1, $2, COALESCE($3::int, $4::int))
+      `INSERT INTO jobs (type, payload, max_attempts, next_run_at)
+             VALUES ($1, $2, COALESCE($3::int, $4::int), COALESCE($5::timestamptz, now()))
              RETURNING *`,
-      [type.trim(), payload ?? {}, maxAttempts ?? null, config.retry.maxAttempts],
+      [
+        type.trim(),
+        payload ?? {},
+        maxAttempts ?? null,
+        config.retry.maxAttempts,
+        nextRunAt,
+      ],
     );
 
     // Return the newly created job with HTTP 201 (Created).

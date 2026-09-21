@@ -24,6 +24,10 @@ export const config = {
 
     claimStrategy,
   },
+  scheduler: {
+    pollIntervalMs: Number(process.env.SCHEDULER_POLL_INTERVAL_MS ?? 1000),
+    id: process.env.SCHEDULER_ID ?? `${hostname()}-${process.pid}`,
+  },
   retry: {
     // Default budget for a job that does not specify its own max_attempts.
     maxAttempts: Number(process.env.RETRY_MAX_ATTEMPTS ?? 3),

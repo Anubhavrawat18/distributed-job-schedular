@@ -303,3 +303,117 @@ curl -X POST localhost:3000/jobs -H 'content-type: application/json' \
 endpoint for it yet. And the Phase 2 gap remains: a job whose worker dies stays
 `running` forever, since `next_run_at` only governs jobs that made it back to
 `pending`. Both the stuck-job lease and crash recovery are Phase 8.
+
+---
+
+## Phase 4 — Scheduling: delayed jobs and cron recurring jobs
+
+**What:** `POST /jobs` accepts `runAt` or `delaySeconds`. A new `recurring_jobs`
+table holds cron *definitions*, and a separate scheduler process
+(`src/scheduler/scheduler.ts`) materialises them into real job rows as each
+occurrence comes due. Adds `POST/GET/PATCH /recurring-jobs`, and a `scheduler`
+service in Compose that is safe to scale.
+
+**Purpose:** Separates *when work should happen* from *when a worker is free*.
+Until now a job was eligible the instant it was inserted; the queue could only
+answer "as soon as possible". Delayed and recurring work is most of what a real
+scheduler is asked for — retry-after-an-hour, nightly reports, hourly digests.
+
+**How it works:**
+
+- **Delayed jobs needed no new column, and that is the interesting part.**
+  `next_run_at` already existed for retry backoff, and the claim query already
+  filtered on it. "Run this in an hour" and "retry this in an hour" are the same
+  statement about eligibility, so a delayed job is just a job whose *first*
+  `next_run_at` is in the future. CLAUDE.md specified a `run_at` column; I
+  reused `next_run_at` instead, because two columns answering "when may this
+  run" would force the claim query to consult both and create a second source of
+  truth to keep consistent. **Flagging it since it deviates from the plan** — the
+  alternative case is that `run_at` (immutable intent) and `next_run_at` (current
+  eligibility, mutated by retries) are genuinely different facts, and splitting
+  them would preserve "what was originally asked for" after a retry overwrites
+  it. I judged that not worth a second column yet.
+
+- **A recurring job is a definition, not a job.** The scheduler reads
+  `recurring_jobs` and inserts concrete rows into `jobs`. Keeping them separate
+  means each occurrence gets its own status, attempts, retries and execution
+  history — "did last night's report run?" stays answerable per night instead of
+  collapsing into one perpetually-rerun row.
+
+- **Claiming a definition uses the same `FOR UPDATE SKIP LOCKED` discipline as
+  claiming a job**, and `next_run_at` is advanced inside that same transaction,
+  so the definition stops being due the moment it is claimed. The failure mode
+  is worse here than for jobs: a duplicated *job* wastes one execution, whereas a
+  duplicated *schedule tick* silently doubles a recurring workload forever.
+
+- **A unique index backstops the lock.** `(recurring_job_id, scheduled_for)` is
+  unique, so one occurrence can produce at most one job — enforced by Postgres,
+  not by the scheduler being careful. The lock should already make duplicates
+  impossible; the index makes them impossible even if that logic is wrong, a
+  scheduler is rolled back to an older build, or someone inserts by hand.
+  Correctness that rests only on application code holding is correctness you
+  cannot prove.
+
+- **Missed occurrences are dropped, not backfilled.** If the scheduler is down
+  for an hour and a job runs every minute, advancing occurrence-by-occurrence
+  would enqueue 60 jobs the moment it recovers — a self-inflicted thundering
+  herd where the recovery is worse than the outage. Instead the scheduler fires
+  the missed tick once and advances from *now*. The tradeoff is explicit and is
+  the right default for "send an hourly digest" and the wrong one for "bill every
+  customer monthly" — billing should derive its period from data, not from the
+  scheduler having been alive.
+
+- **Cron expressions are validated at creation time**, so a typo returns a 400
+  from `POST /recurring-jobs` rather than being discovered by a crashing
+  scheduler at 3am.
+
+**Measured results** (`npm run test:scheduling`, 5 workers, **3 schedulers**):
+
+| Check | Result |
+|---|---|
+| Delayed job halfway through its delay | still `pending`, 0 attempts |
+| Delayed job after its run time | `completed` |
+| Recurring definition produces a job, advances `next_run_at` | yes |
+| **60 definitions due at once, 3 schedulers racing** | **60 jobs, 0 duplicates** |
+| All recurring occurrences ever scheduled | 0 duplicates |
+| `*/5` from 00:02 | 00:05 |
+| `0 9 * * *` in `Asia/Kolkata` | 03:30 UTC |
+
+The 60-definitions case exists because the single-occurrence check was weak
+evidence: with one definition ticking once, three schedulers may simply never
+have collided. Dropping 60 in as due simultaneously forces contention.
+
+The unique index was verified by **attempting the violation directly** rather
+than assuming it holds — inserting the same `(recurring_job_id, scheduled_for)`
+twice is rejected with `23505`, confirming the backstop is real and not
+decorative. Phases 2 and 3 still pass unchanged.
+
+**One design bug caught while building:** `nextOccurrence` initially lived in
+`scheduler.ts`, and the API imported it to validate cron expressions. That
+import would have executed the scheduler's module-level `main()` *inside the API
+process*, silently giving every API replica its own scheduler loop — a
+duplicate-tick source that the row lock would have hidden but the unique index
+would have caught. Moved to `src/scheduler/cron.ts`. A reminder that in
+CommonJS, importing a name from a module runs that whole module.
+
+**Running it:**
+
+```bash
+docker compose up -d --build --scale worker=5 --scale scheduler=3
+npm run db:init
+npm run test:scheduling
+```
+
+```bash
+curl -X POST localhost:3000/jobs -H 'content-type: application/json' \
+  -d '{"type":"tick","delaySeconds":30}'
+
+curl -X POST localhost:3000/recurring-jobs -H 'content-type: application/json' \
+  -d '{"name":"nightly-report","type":"tick","cron":"0 9 * * *","timezone":"Asia/Kolkata"}'
+```
+
+**Still open:** there is no endpoint to delete a recurring definition (only
+disable, since deleting sets `recurring_job_id` to NULL on every job it ever
+produced and loses that provenance). Priority and per-type rate limits are
+Phase 5 — right now a flood of scheduled jobs competes with interactive ones on
+equal terms, which is exactly the problem priority ordering exists to solve.

@@ -9,9 +9,12 @@
     "build": "tsc -p tsconfig.json",
     "db:init": "ts-node src/db/init.ts",
     "test:concurrency": "ts-node tests/concurrency.ts",
-    "test:retry": "ts-node tests/retry.ts"
+    "test:retry": "ts-node tests/retry.ts",
+    "test:scheduling": "ts-node tests/scheduling.ts",
+    "dev:scheduler": "ts-node-dev --respawn --transpile-only src/scheduler/scheduler.ts"
   },
   "dependencies": {
+    "cron-parser": "^5.10.1",
     "dotenv": "^16.4.5",
     "express": "^4.19.2",
     "pg": "^8.12.0"

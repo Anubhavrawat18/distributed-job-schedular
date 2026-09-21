@@ -26,6 +26,9 @@ const handlers: Record<string, JobHandler> = {
     throw new Error(String(payload.message ?? "job asked to fail"));
   },
 
+  // Trivial no-op, used as the body of recurring jobs in tests.
+  tick: async (payload) => ({ tickedAt: new Date().toISOString(), ...payload }),
+
   // Fails its first `failTimes` attempts, then succeeds — the shape of a real
   // transient fault, and what proves retries actually recover a job rather than
   // just delaying its death.

@@ -2,6 +2,7 @@ import express, { type ErrorRequestHandler } from "express";
 import { config } from "../config";
 import { pool } from "../db/client";
 import { jobsRouter } from "./routes/jobs";
+import { recurringJobsRouter } from "./routes/recurringJobs";
 
 const app = express();
 
@@ -21,6 +22,7 @@ app.get("/health", async (_req, res) => {
 });
 
 app.use(jobsRouter);
+app.use(recurringJobsRouter);
 
 const errorHandler: ErrorRequestHandler = (err, _req, res, _next) => {
   console.error("[api] unhandled error", err);
