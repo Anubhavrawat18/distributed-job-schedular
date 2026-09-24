@@ -10,6 +10,18 @@ if (claimStrategy !== "skip_locked" && claimStrategy !== "naive") {
   throw new Error(`CLAIM_STRATEGY must be "skip_locked" or "naive", got "${claimStrategy}"`);
 }
 
+// Phase 5: "approximate" skips the advisory-lock recheck and trusts the
+// snapshot-based filter alone, which makes the cap race reproducible rather
+// than merely described. Same idea as CLAIM_STRATEGY=naive.
+export type CapEnforcement = "exact" | "approximate";
+
+const capEnforcement = (process.env.CAP_ENFORCEMENT ?? "exact") as CapEnforcement;
+if (capEnforcement !== "exact" && capEnforcement !== "approximate") {
+  throw new Error(
+    `CAP_ENFORCEMENT must be "exact" or "approximate", got "${capEnforcement}"`,
+  );
+}
+
 export const config = {
   port: Number(process.env.PORT ?? 3000),
   databaseUrl:
@@ -23,6 +35,12 @@ export const config = {
     id: process.env.WORKER_ID ?? `${hostname()}-${process.pid}`,
 
     claimStrategy,
+    capEnforcement,
+
+    // Starvation control. A job's effective priority rises by 1 for every this
+    // many seconds it has been eligible but unclaimed. 0 disables aging, which
+    // makes starvation reproducible rather than merely described.
+    priorityAgingSeconds: Number(process.env.PRIORITY_AGING_SECONDS ?? 60),
   },
   scheduler: {
     pollIntervalMs: Number(process.env.SCHEDULER_POLL_INTERVAL_MS ?? 1000),

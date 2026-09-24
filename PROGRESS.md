@@ -417,3 +417,124 @@ disable, since deleting sets `recurring_job_id` to NULL on every job it ever
 produced and loses that provenance). Priority and per-type rate limits are
 Phase 5 — right now a flood of scheduled jobs competes with interactive ones on
 equal terms, which is exactly the problem priority ordering exists to solve.
+
+---
+
+## Phase 5 — Priority ordering and per-type concurrency caps
+
+**What:** Jobs carry a `priority` (higher wins), the claim query orders by it,
+and effective priority *ages upward* the longer a job waits so nothing starves.
+A `job_type_limits` table caps how many jobs of a given type may run at once,
+enforced inside the claim. Adds `priority` to `POST /jobs` and
+`/recurring-jobs`, plus `GET/PUT/DELETE /job-type-limits`.
+
+**Purpose:** Two different fairness problems.
+
+*Priority* answers "this password-reset email matters more than that nightly
+report" — without it, a flood of scheduled work delays interactive work simply
+by arriving first.
+
+*Concurrency caps* answer the opposite question: how to stop the queue from
+being too effective. A fleet of 15 workers that all pick up jobs calling the
+same third-party API will cheerfully open 15 connections and get rate-limited
+or blocked. The queue must throttle itself against constraints it does not own.
+
+**How it works:**
+
+- **Priority alone is a liveness bug.** If high-priority jobs keep arriving, a
+  priority-0 job sits pending forever. Aging fixes it the way OS schedulers do:
+  effective priority is `priority + floor(seconds_waiting / PRIORITY_AGING_SECONDS)`,
+  so any job eventually outranks the incoming stream no matter how humble it
+  started. With the default of 60s, a priority-0 job waiting 30 minutes scores
+  30 and overtakes a *fresh* priority-20 job.
+
+- **Age is measured from `next_run_at`, not `created_at`.** This looks like a
+  detail and is not. Using `created_at` would let a job scheduled a month in
+  advance arrive already enormously aged and immediately outrank everything — it
+  would have been "waiting" a month without ever having been *eligible*.
+  `next_run_at` measures time spent actually waiting for a worker, which is the
+  thing aging is meant to compensate for.
+
+- **The cap check is two-layered, and both layers are load-bearing.**
+
+  The first is an approximate filter inside the candidate query: exclude types
+  whose running count is already at the cap. It reads from the transaction's
+  snapshot, so it can be wrong. Its real job is preventing **head-of-line
+  blocking** — without it, a worker would keep selecting the highest-priority
+  job, discover its type was at cap, and give up, while claimable work of other
+  types sat behind it. A stalled queue is worse than a briefly exceeded cap.
+
+  The second is an exact recheck under `pg_advisory_xact_lock(hashtext(type))`.
+  Postgres has no declarative way to say "at most N rows of this type may be in
+  state `running`" — no constraint expresses it — so the invariant needs a lock.
+  Keying it on the *job type* means only workers contending for the same capped
+  type serialise; the rest of the fleet is unaffected.
+
+- **Why an advisory lock rather than locking a row in `job_type_limits`:**
+  locking the limit row would work, but the lock is wanted *before* the type is
+  known — and advisory locks are released automatically at transaction end, so a
+  crashed worker cannot wedge a type shut.
+
+**Measured results** (`npm run test:priority`):
+
+| Check | Result |
+|---|---|
+| Claim order for a mixed batch | `10,10,10,10, 5,5,5,5, 0,0,0,0` — exact |
+| Mean claim position (p10 / p5 / p0) | 1.5 / 5.5 / 9.5 |
+| Priority 0 waiting 30min vs fresh priority 20 | effective **30 vs 20** — starving job wins |
+| Cap of 2, 30 jobs, 136 samples | peak **2** — never breached, fully saturated |
+| Uncapped jobs behind a capped backlog | ran to completion while 10 capped jobs were still in flight |
+
+**The finding worth keeping.** The cap test was initially run at 5 workers and
+passed *even with the advisory lock disabled* — the window between reading the
+running count and committing the claim is sub-millisecond, so the race never
+came up. Raising the fleet to 15 workers:
+
+| Enforcement | Workers | Cap | Peak observed |
+|---|---|---|---|
+| `approximate` (snapshot filter only) | 5 | 2 | 2 — passes, misleadingly |
+| `approximate` | 15 | 2 | **4 — double the cap** |
+| `exact` (advisory lock recheck) | 15 | 2 | 2 |
+
+A cap that holds under light load and silently doubles under heavy load is the
+worst possible failure mode, because the test that would catch it passes on a
+developer machine. `CAP_ENFORCEMENT=approximate` is kept as a setting, like
+`CLAIM_STRATEGY=naive`, so the breach can be reproduced on demand rather than
+taken on trust.
+
+**Known cost:** with aging enabled the sort key is an expression over `now()`,
+so no index can serve the ordering and Postgres must sort the eligible rows.
+`idx_jobs_claim` still narrows the scan to eligible rows, which is the expensive
+part, and the sort is over a set that stays small while the fleet keeps up. If
+the queue ever developed a deep backlog this would be the first thing to
+revisit — a bucketed or periodically-materialised effective priority would trade
+exactness for an indexable sort key.
+
+Phases 2–4 all still pass at 15 workers (200 jobs / 200 executions / 0
+duplicates; retries and backoff unchanged; 60 definitions / 3 schedulers / 0
+duplicate occurrences).
+
+**Running it:**
+
+```bash
+docker compose up -d --build --scale worker=15
+npm run db:init
+npm run test:priority
+```
+
+```bash
+CAP_ENFORCEMENT=approximate docker compose up -d --scale worker=15
+npm run test:priority   # FAIL: peak 4 against a cap of 2
+```
+
+```bash
+curl -X PUT localhost:3000/job-type-limits/send-email \
+  -H 'content-type: application/json' -d '{"maxConcurrency":3}'
+curl -X POST localhost:3000/jobs -H 'content-type: application/json' \
+  -d '{"type":"tick","priority":10}'
+```
+
+**Still open:** caps are global per type, not per tenant — one noisy customer
+can still consume a type's entire budget. Idempotency keys are Phase 6, which
+matters more than it sounds now: retries (Phase 3) mean a job *can* run twice
+when a worker dies after completing its side effect but before recording it.

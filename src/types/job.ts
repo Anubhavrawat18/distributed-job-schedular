@@ -13,7 +13,14 @@ export interface Job {
     next_run_at: string;
     recurring_job_id: number | null;
     scheduled_for: string | null;
+    priority: number;
     created_at: string;
+    updated_at: string;
+}
+
+export interface JobTypeLimit {
+    type: string;
+    max_concurrency: number;
     updated_at: string;
 }
 
@@ -26,6 +33,7 @@ export interface RecurringJob {
     timezone: string;
     max_attempts: number;
     enabled: boolean;
+    priority: number;
     next_run_at: string;
     last_enqueued_at: string | null;
     created_at: string;

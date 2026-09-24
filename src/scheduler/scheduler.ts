@@ -90,8 +90,8 @@ async function materialise(
   // (recurring_job_id, scheduled_for): if this occurrence somehow already
   // exists, the insert is a no-op instead of an error.
   const { rows } = await pool.query<{ id: number }>(
-    `INSERT INTO jobs (type, payload, max_attempts, next_run_at, recurring_job_id, scheduled_for)
-     VALUES ($1, $2, $3, $4, $5, $4)
+    `INSERT INTO jobs (type, payload, max_attempts, next_run_at, recurring_job_id, scheduled_for, priority)
+     VALUES ($1, $2, $3, $4, $5, $4, $6)
      ON CONFLICT (recurring_job_id, scheduled_for) WHERE recurring_job_id IS NOT NULL
      DO NOTHING
      RETURNING id`,
@@ -101,6 +101,7 @@ async function materialise(
       definition.max_attempts,
       scheduledFor,
       definition.id,
+      definition.priority,
     ],
   );
 

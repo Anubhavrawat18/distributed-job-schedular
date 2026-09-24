@@ -32,7 +32,8 @@ jobsRouter.post(
   asyncRoute(async (req, res) => {
     // Get `type` and `payload` from the request body.
     // If req.body doesn't exist, use an empty object instead.
-    const { type, payload, maxAttempts, runAt, delaySeconds } = req.body ?? {};
+    const { type, payload, maxAttempts, runAt, delaySeconds, priority } =
+      req.body ?? {};
 
     // Make sure `type` is a string and is not empty.
     if (typeof type !== "string" || type.trim() === "") {
@@ -63,6 +64,12 @@ jobsRouter.post(
       return res
         .status(400)
         .json({ error: "`maxAttempts` must be an integer >= 1" });
+    }
+
+    // Higher number wins. Aging means a low priority delays a job rather than
+    // condemning it, so callers cannot starve their own work by guessing wrong.
+    if (priority !== undefined && !Number.isInteger(priority)) {
+      return res.status(400).json({ error: "`priority` must be an integer" });
     }
 
     // A delayed job needs no special machinery: next_run_at already gates
@@ -100,8 +107,8 @@ jobsRouter.post(
     //
     // RETURNING * tells PostgreSQL to return the newly inserted row.
     const { rows } = await pool.query<Job>(
-      `INSERT INTO jobs (type, payload, max_attempts, next_run_at)
-             VALUES ($1, $2, COALESCE($3::int, $4::int), COALESCE($5::timestamptz, now()))
+      `INSERT INTO jobs (type, payload, max_attempts, next_run_at, priority)
+             VALUES ($1, $2, COALESCE($3::int, $4::int), COALESCE($5::timestamptz, now()), COALESCE($6::int, 0))
              RETURNING *`,
       [
         type.trim(),
@@ -109,6 +116,7 @@ jobsRouter.post(
         maxAttempts ?? null,
         config.retry.maxAttempts,
         nextRunAt,
+        priority ?? null,
       ],
     );
 

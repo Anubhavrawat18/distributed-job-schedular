@@ -16,7 +16,8 @@ recurringJobsRouter.post(
   "/recurring-jobs",
 
   asyncRoute(async (req, res) => {
-    const { name, type, payload, cron, timezone, maxAttempts } = req.body ?? {};
+    const { name, type, payload, cron, timezone, maxAttempts, priority } =
+      req.body ?? {};
 
     if (typeof name !== "string" || name.trim() === "") {
       return res.status(400).json({ error: "`name` must be a non-empty string" });
@@ -39,6 +40,9 @@ recurringJobsRouter.post(
     ) {
       return res.status(400).json({ error: "`maxAttempts` must be an integer >= 1" });
     }
+    if (priority !== undefined && !Number.isInteger(priority)) {
+      return res.status(400).json({ error: "`priority` must be an integer" });
+    }
 
     const tz = typeof timezone === "string" && timezone.trim() !== "" ? timezone : "UTC";
 
@@ -55,8 +59,8 @@ recurringJobsRouter.post(
 
     try {
       const { rows } = await pool.query<RecurringJob>(
-        `INSERT INTO recurring_jobs (name, type, payload, cron_expression, timezone, max_attempts, next_run_at)
-         VALUES ($1, $2, $3, $4, $5, COALESCE($6::int, $7::int), $8)
+        `INSERT INTO recurring_jobs (name, type, payload, cron_expression, timezone, max_attempts, next_run_at, priority)
+         VALUES ($1, $2, $3, $4, $5, COALESCE($6::int, $7::int), $8, COALESCE($9::int, 0))
          RETURNING *`,
         [
           name.trim(),
@@ -67,6 +71,7 @@ recurringJobsRouter.post(
           maxAttempts ?? null,
           config.retry.maxAttempts,
           firstRunAt,
+          priority ?? null,
         ],
       );
       return res.status(201).json(rows[0]);
