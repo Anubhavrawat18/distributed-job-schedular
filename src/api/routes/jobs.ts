@@ -35,6 +35,20 @@ jobsRouter.post(
     const { type, payload, maxAttempts, runAt, delaySeconds, priority } =
       req.body ?? {};
 
+    // Accepted from either the body or the Idempotency-Key header, which is the
+    // convention most HTTP APIs (Stripe, PayPal) already use.
+    const idempotencyKey =
+      req.body?.idempotencyKey ?? req.header("Idempotency-Key") ?? null;
+
+    if (
+      idempotencyKey !== null &&
+      (typeof idempotencyKey !== "string" || idempotencyKey.trim() === "")
+    ) {
+      return res
+        .status(400)
+        .json({ error: "`idempotencyKey` must be a non-empty string" });
+    }
+
     // Make sure `type` is a string and is not empty.
     if (typeof type !== "string" || type.trim() === "") {
       // If validation fails, return HTTP 400 (Bad Request).
@@ -106,9 +120,15 @@ jobsRouter.post(
     // $1..$5 are placeholders for the values in the array below.
     //
     // RETURNING * tells PostgreSQL to return the newly inserted row.
+    // ON CONFLICT DO NOTHING rather than a read-then-write check: two
+    // simultaneous retries of the same request would both pass a prior SELECT
+    // and both insert. Letting the unique index arbitrate makes the collapse
+    // atomic.
     const { rows } = await pool.query<Job>(
-      `INSERT INTO jobs (type, payload, max_attempts, next_run_at, priority)
-             VALUES ($1, $2, COALESCE($3::int, $4::int), COALESCE($5::timestamptz, now()), COALESCE($6::int, 0))
+      `INSERT INTO jobs (type, payload, max_attempts, next_run_at, priority, idempotency_key)
+             VALUES ($1, $2, COALESCE($3::int, $4::int), COALESCE($5::timestamptz, now()), COALESCE($6::int, 0), $7)
+             ON CONFLICT (idempotency_key) WHERE idempotency_key IS NOT NULL
+             DO NOTHING
              RETURNING *`,
       [
         type.trim(),
@@ -117,8 +137,20 @@ jobsRouter.post(
         config.retry.maxAttempts,
         nextRunAt,
         priority ?? null,
+        idempotencyKey === null ? null : idempotencyKey.trim(),
       ],
     );
+
+    // No row means the key already existed: this is a retry of a request that
+    // already succeeded. Return the original job with 200 instead of 201, so
+    // the caller can tell a replay from a fresh create.
+    if (rows.length === 0) {
+      const { rows: existing } = await pool.query<Job>(
+        `SELECT * FROM jobs WHERE idempotency_key = $1`,
+        [(idempotencyKey as string).trim()],
+      );
+      return res.status(200).json(existing[0]);
+    }
 
     // Return the newly created job with HTTP 201 (Created).
     return res.status(201).json(rows[0]);

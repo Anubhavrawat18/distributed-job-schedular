@@ -12,6 +12,7 @@
     "test:retry": "ts-node tests/retry.ts",
     "test:scheduling": "ts-node tests/scheduling.ts",
     "test:priority": "ts-node tests/priority.ts",
+    "test:idempotency": "ts-node tests/idempotency.ts",
     "dev:scheduler": "ts-node-dev --respawn --transpile-only src/scheduler/scheduler.ts"
   },
   "dependencies": {

@@ -1,11 +1,24 @@
+import type { PoolClient } from "pg";
 import { pool } from "../db/client";
 import { config } from "../config";
 import { computeBackoffMs } from "../retry/backoff";
+import { withIdempotency, type IdempotentOutcome } from "../idempotency/withIdempotency";
 import type { Job } from "../types/job";
 
 interface JobContext {
   attempt: number;
   maxAttempts: number;
+  jobId: number;
+
+  /**
+   * Performs `fn` at most once across every attempt of this job. The key is
+   * scoped to the job, so retries of the same job share it while unrelated jobs
+   * never collide.
+   */
+  idempotent: <T>(
+    name: string,
+    fn: (client: PoolClient) => Promise<T>,
+  ) => Promise<IdempotentOutcome<T>>;
 }
 
 type JobHandler = (
@@ -28,6 +41,36 @@ const handlers: Record<string, JobHandler> = {
 
   // Trivial no-op, used as the body of recurring jobs in tests.
   tick: async (payload) => ({ tickedAt: new Date().toISOString(), ...payload }),
+
+  /**
+   * Performs a side effect and then dies, which is the exact shape of the bug
+   * idempotency exists to fix: the effect committed, but the worker never got
+   * to record that the job finished, so the attempt is retried.
+   *
+   * With IDEMPOTENCY=enforced the effect is written once no matter how many
+   * attempts run. With IDEMPOTENCY=off the row count equals the attempt count.
+   */
+  "charge-then-crash": async (payload, ctx) => {
+    const label = String(payload.label ?? `job-${ctx.jobId}`);
+    const crashUntilAttempt = Number(payload.crashUntilAttempt ?? 1);
+
+    const outcome = await ctx.idempotent("charge", async (client) => {
+      const { rows } = await client.query<{ id: number }>(
+        `INSERT INTO side_effects (job_id, label) VALUES ($1, $2) RETURNING id`,
+        [ctx.jobId, label],
+      );
+      return { sideEffectId: rows[0].id };
+    });
+
+    // The "crash": the effect is committed, this attempt then fails. A real
+    // crash would be a killed process; throwing here is the deterministic
+    // equivalent and exercises the same retry path.
+    if (ctx.attempt <= crashUntilAttempt) {
+      throw new Error(`crashed after performing side effect on attempt ${ctx.attempt}`);
+    }
+
+    return { ...outcome.result, repeatedEffect: !outcome.executed };
+  },
 
   // Fails its first `failTimes` attempts, then succeeds — the shape of a real
   // transient fault, and what proves retries actually recover a job rather than
@@ -69,6 +112,9 @@ export async function executeJob(job: Job, workerId: string): Promise<void> {
     const result = await handler(job.payload, {
       attempt: job.attempts,
       maxAttempts: job.max_attempts,
+      jobId: job.id,
+      idempotent: (name, fn) =>
+        withIdempotency(`job:${job.id}:${name}`, job.id, fn),
     });
     await pool.query(
       `UPDATE jobs

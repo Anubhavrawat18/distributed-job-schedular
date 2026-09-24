@@ -538,3 +538,118 @@ curl -X POST localhost:3000/jobs -H 'content-type: application/json' \
 can still consume a type's entire budget. Idempotency keys are Phase 6, which
 matters more than it sounds now: retries (Phase 3) mean a job *can* run twice
 when a worker dies after completing its side effect but before recording it.
+
+---
+
+## Phase 6 — Idempotency and safe re-execution
+
+**What:** Two guards for two different duplication problems. `POST /jobs`
+accepts an `Idempotency-Key` header (or `idempotencyKey` in the body) so
+retrying a request cannot create a second job. Handlers get
+`ctx.idempotent(name, fn)`, which performs a side effect at most once across
+every attempt of a job, backed by an `idempotency_records` table.
+
+**Purpose:** Closes the correctness hole that retries opened in Phase 3.
+
+The thing worth being precise about: **exactly-once execution is not
+achievable.** A worker cannot atomically perform a side effect and record that
+it performed it — there is always an instant where one has happened and the
+other has not, and a crash in that instant is indistinguishable from a crash
+just before. What *is* achievable is at-least-once execution combined with
+effects that are safe to repeat, which no observer can tell apart from
+exactly-once. Phases 1–5 built the at-least-once half; this phase builds the
+other.
+
+Note that Phase 2 does not help here. `SKIP LOCKED` prevents two workers
+running a job *concurrently*; this is one worker running it twice
+*sequentially*, which is not a race at all and no amount of locking prevents it.
+
+**How it works:**
+
+- **Enqueue idempotency.** A client that sends a request and gets a timeout
+  cannot tell whether the request was lost or the response was — so retrying has
+  to be safe. A unique partial index on `jobs.idempotency_key` plus
+  `INSERT ... ON CONFLICT DO NOTHING` collapses retries onto one row. A replay
+  returns **200 with the original job** rather than 201, so the caller can
+  distinguish a replay from a fresh create.
+
+  `ON CONFLICT` rather than checking first: two simultaneous retries would both
+  pass a prior `SELECT` and both insert. Letting the index arbitrate makes the
+  collapse atomic. Verified with 10 simultaneous enqueues on one key — exactly
+  one job created.
+
+- **Execution idempotency, and why it is one transaction.** The guard record and
+  the effect commit *together*. Splitting them fails in either order:
+
+  | Order | Failure on a crash between the two |
+  |---|---|
+  | record, then effect | the effect is lost forever — the record claims it happened |
+  | effect, then record | the effect repeats on the next attempt — the original bug |
+
+  Only a single transaction makes the pair atomic. This is why
+  `ctx.idempotent(name, fn)` hands `fn` the transaction's client: an effect
+  issued on a different connection is outside the transaction and gets none of
+  the protection.
+
+- **Concurrency is delegated to Postgres.** Two workers racing on the same key
+  both attempt the insert; the second blocks on the first's uncommitted row, and
+  once the first commits, `ON CONFLICT DO NOTHING` returns nothing so the second
+  takes the already-done path. If the first rolls back, the second's insert
+  succeeds and it performs the effect. Either way the effect happens once, with
+  no application-level locking.
+
+- **The stored result matters as much as the skip.** A repeat execution returns
+  the *original* result rather than nothing, so a handler that needs the charge
+  id can still get it on attempt 3.
+
+**Measured results** (`npm run test:idempotency`). The `charge-then-crash`
+handler commits a side effect and then fails, reproducing a worker killed after
+its effect landed:
+
+| Mode | Executions | Side effects | Verdict |
+|---|---|---|---|
+| `IDEMPOTENCY=enforced` | 3 | **1** | effect performed once, job completed |
+| `IDEMPOTENCY=off` | 3 | **3** | one charge per attempt — the bug |
+
+| Check | Result |
+|---|---|
+| Repeat execution reused the stored result | `{"sideEffectId":2,"repeatedEffect":true}` |
+| 10 simultaneous enqueues, one key | 1 job created |
+| 12 concurrent racers on one guarded key | 1 performed the effect, 1 row, all saw the same result |
+| `POST /jobs` twice with one `Idempotency-Key` | 201 then **200**, same job id |
+
+All five suites pass at 15 workers.
+
+**The honest limitation.** This protects effects that live *in the same
+Postgres database*, because that is what a shared transaction can cover. A real
+charge against a payment provider cannot enrol in our transaction, so the same
+crash window exists between "provider charged the card" and "we committed the
+record". The fix there is the same idea one level out: pass the key to the
+provider and let *them* deduplicate — which is exactly what Stripe's
+`Idempotency-Key` header is for. The pattern does not disappear at the network
+boundary, it just changes who enforces it.
+
+**Running it:**
+
+```bash
+docker compose up -d --build --scale worker=5
+npm run db:init
+npm run test:idempotency
+```
+
+```bash
+IDEMPOTENCY=off docker compose up -d --scale worker=5
+npm run test:idempotency   # 3 executions, 3 side effects
+```
+
+```bash
+curl -X POST localhost:3000/jobs -H 'content-type: application/json' \
+  -H 'Idempotency-Key: order-4471-charge' -d '{"type":"tick"}'
+```
+
+**Still open:** idempotency records are never pruned, so the table grows
+forever — real systems expire keys (Stripe uses 24 hours), and doing that needs
+a retention policy plus a cleanup job. Crash recovery is still missing entirely:
+a worker killed mid-execution leaves its job `running` with nothing to reclaim
+it, so the retry path this phase protects never even triggers. That is Phase 8,
+and it is what makes this phase's guarantee actually reachable.

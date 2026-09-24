@@ -22,6 +22,13 @@ if (capEnforcement !== "exact" && capEnforcement !== "approximate") {
   );
 }
 
+export type IdempotencyMode = "enforced" | "off";
+
+const idempotencyMode = (process.env.IDEMPOTENCY ?? "enforced") as IdempotencyMode;
+if (idempotencyMode !== "enforced" && idempotencyMode !== "off") {
+  throw new Error(`IDEMPOTENCY must be "enforced" or "off", got "${idempotencyMode}"`);
+}
+
 export const config = {
   port: Number(process.env.PORT ?? 3000),
   databaseUrl:
@@ -45,6 +52,11 @@ export const config = {
   scheduler: {
     pollIntervalMs: Number(process.env.SCHEDULER_POLL_INTERVAL_MS ?? 1000),
     id: process.env.SCHEDULER_ID ?? `${hostname()}-${process.pid}`,
+  },
+  idempotency: {
+    // "off" skips the guard entirely so a repeated side effect can be
+    // demonstrated rather than described.
+    mode: idempotencyMode,
   },
   retry: {
     // Default budget for a job that does not specify its own max_attempts.

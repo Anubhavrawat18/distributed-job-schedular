@@ -14,6 +14,7 @@ export interface Job {
     recurring_job_id: number | null;
     scheduled_for: string | null;
     priority: number;
+    idempotency_key: string | null;
     created_at: string;
     updated_at: string;
 }
