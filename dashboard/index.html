@@ -1,0 +1,333 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Job Scheduler</title>
+    <style>
+      :root {
+        --bg: #0f1115;
+        --panel: #171a21;
+        --border: #262b36;
+        --text: #e6e8ee;
+        --muted: #8b93a7;
+        --accent: #6aa9ff;
+        --ok: #4ec9a5;
+        --warn: #e0b341;
+        --bad: #e8646b;
+        --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        padding: 20px;
+        background: var(--bg);
+        color: var(--text);
+        font: 14px/1.5 system-ui, -apple-system, Segoe UI, sans-serif;
+      }
+      header {
+        display: flex;
+        align-items: baseline;
+        gap: 14px;
+        flex-wrap: wrap;
+        margin-bottom: 18px;
+      }
+      h1 { font-size: 18px; margin: 0; font-weight: 600; }
+      .meta { color: var(--muted); font-size: 12px; font-family: var(--mono); }
+      .grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+        gap: 10px;
+        margin-bottom: 18px;
+      }
+      .tile {
+        background: var(--panel);
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        padding: 12px 14px;
+      }
+      .tile .label {
+        color: var(--muted);
+        font-size: 11px;
+        text-transform: uppercase;
+        letter-spacing: 0.06em;
+      }
+      .tile .value { font-size: 26px; font-weight: 600; font-variant-numeric: tabular-nums; }
+      .tile .sub { color: var(--muted); font-size: 11px; font-family: var(--mono); }
+      .value.ok { color: var(--ok); }
+      .value.warn { color: var(--warn); }
+      .value.bad { color: var(--bad); }
+      section {
+        background: var(--panel);
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        margin-bottom: 14px;
+        overflow: hidden;
+      }
+      section > h2 {
+        font-size: 12px;
+        text-transform: uppercase;
+        letter-spacing: 0.06em;
+        color: var(--muted);
+        margin: 0;
+        padding: 10px 14px;
+        border-bottom: 1px solid var(--border);
+        font-weight: 600;
+      }
+      table { width: 100%; border-collapse: collapse; font-size: 13px; }
+      th {
+        text-align: left;
+        color: var(--muted);
+        font-weight: 500;
+        font-size: 11px;
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+        padding: 8px 14px;
+        border-bottom: 1px solid var(--border);
+      }
+      td { padding: 7px 14px; border-bottom: 1px solid rgba(38, 43, 54, 0.5); }
+      tr:last-child td { border-bottom: none; }
+      td.mono, th.mono { font-family: var(--mono); font-size: 12px; }
+      td.num { text-align: right; font-variant-numeric: tabular-nums; font-family: var(--mono); }
+      .empty { padding: 14px; color: var(--muted); font-size: 13px; }
+      .pill {
+        display: inline-block;
+        padding: 1px 7px;
+        border-radius: 999px;
+        font-size: 11px;
+        font-family: var(--mono);
+        border: 1px solid var(--border);
+      }
+      .pill.running { color: var(--accent); border-color: var(--accent); }
+      .pill.completed { color: var(--ok); border-color: var(--ok); }
+      .pill.failed { color: var(--bad); border-color: var(--bad); }
+      .pill.pending { color: var(--muted); }
+      .err {
+        font-family: var(--mono);
+        font-size: 12px;
+        color: var(--bad);
+        max-width: 460px;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      .cap { color: var(--muted); }
+      .cap.at { color: var(--warn); }
+      .two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+      @media (max-width: 900px) { .two-col { grid-template-columns: 1fr; } }
+      #error {
+        display: none;
+        background: rgba(232, 100, 107, 0.12);
+        border: 1px solid var(--bad);
+        color: var(--bad);
+        padding: 10px 14px;
+        border-radius: 8px;
+        margin-bottom: 14px;
+        font-family: var(--mono);
+        font-size: 12px;
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>Job Scheduler</h1>
+      <span class="meta" id="meta">connecting…</span>
+    </header>
+
+    <div id="error"></div>
+
+    <div class="grid" id="tiles"></div>
+
+    <section>
+      <h2>By job type</h2>
+      <div id="byType"></div>
+    </section>
+
+    <div class="two-col">
+      <section>
+        <h2>Workers (last 5 min)</h2>
+        <div id="workers"></div>
+      </section>
+      <section>
+        <h2>Recurring schedules</h2>
+        <div id="recurring"></div>
+      </section>
+    </div>
+
+    <section>
+      <h2>Dead-letter queue</h2>
+      <div id="failures"></div>
+    </section>
+
+    <section>
+      <h2>Recent executions</h2>
+      <div id="executions"></div>
+    </section>
+
+    <script>
+      const POLL_MS = 2000;
+
+      const esc = (v) =>
+        String(v ?? "").replace(/[&<>"']/g, (c) => ({
+          "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
+        })[c]);
+
+      function ago(iso) {
+        const s = Math.max(0, Math.round((Date.now() - new Date(iso).getTime()) / 1000));
+        if (s < 60) return s + "s ago";
+        if (s < 3600) return Math.floor(s / 60) + "m ago";
+        return Math.floor(s / 3600) + "h ago";
+      }
+
+      function duration(seconds) {
+        if (seconds === null) return "—";
+        if (seconds < 60) return seconds + "s";
+        if (seconds < 3600) return Math.floor(seconds / 60) + "m " + (seconds % 60) + "s";
+        return Math.floor(seconds / 3600) + "h " + Math.floor((seconds % 3600) / 60) + "m";
+      }
+
+      function table(cols, rows, renderRow) {
+        if (!rows.length) return '<div class="empty">nothing to show</div>';
+        return (
+          "<table><thead><tr>" +
+          cols.map((c) => '<th class="' + (c.cls || "") + '">' + esc(c.label) + "</th>").join("") +
+          "</tr></thead><tbody>" +
+          rows.map(renderRow).join("") +
+          "</tbody></table>"
+        );
+      }
+
+      function tiles(s) {
+        const h = s.health;
+        const c = s.statusCounts;
+
+        // Backlog age drives the colour, because it is the metric that says
+        // whether the fleet is keeping up. Queue depth alone does not.
+        const ageClass =
+          h.oldestPendingSeconds === null ? "ok"
+          : h.oldestPendingSeconds > 60 ? "bad"
+          : h.oldestPendingSeconds > 10 ? "warn"
+          : "ok";
+
+        return [
+          { label: "Oldest waiting", value: duration(h.oldestPendingSeconds), cls: ageClass,
+            sub: h.dueNow + " due now" },
+          { label: "Running", value: c.running, cls: c.running > 0 ? "ok" : "",
+            sub: s.workers.length + " active workers" },
+          { label: "Pending", value: c.pending,
+            sub: h.scheduledAhead + " scheduled ahead" },
+          { label: "Throughput", value: h.executionsLastMinute, cls: "",
+            sub: "executions / min" },
+          { label: "Completed", value: c.completed,
+            sub: "+" + h.completedLastMinute + " last min" },
+          { label: "Retrying", value: h.retryingNow, cls: h.retryingNow > 0 ? "warn" : "",
+            sub: "waiting on backoff" },
+          { label: "Dead-lettered", value: h.deadLetterTotal, cls: h.deadLetterTotal > 0 ? "bad" : "",
+            sub: "+" + h.failedLastMinute + " failed last min" },
+        ]
+          .map(
+            (t) =>
+              '<div class="tile"><div class="label">' + esc(t.label) + "</div>" +
+              '<div class="value ' + (t.cls || "") + '">' + esc(t.value) + "</div>" +
+              '<div class="sub">' + esc(t.sub) + "</div></div>",
+          )
+          .join("");
+      }
+
+      function render(s) {
+        document.getElementById("meta").textContent =
+          "updated " + new Date(s.takenAt).toLocaleTimeString() + " · " + s.queryMs + "ms";
+
+        document.getElementById("tiles").innerHTML = tiles(s);
+
+        document.getElementById("byType").innerHTML = table(
+          [
+            { label: "Type" }, { label: "Pending", cls: "num" }, { label: "Running", cls: "num" },
+            { label: "Cap", cls: "num" }, { label: "Done / hr", cls: "num" },
+            { label: "Failed / hr", cls: "num" },
+          ],
+          s.byType,
+          (r) => {
+            const atCap = r.max_concurrency !== null && r.running >= r.max_concurrency;
+            return (
+              "<tr><td class='mono'>" + esc(r.type) + "</td>" +
+              "<td class='num'>" + r.pending + "</td>" +
+              "<td class='num'>" + r.running + "</td>" +
+              "<td class='num cap " + (atCap ? "at" : "") + "'>" +
+                (r.max_concurrency === null ? "—" : r.max_concurrency) + "</td>" +
+              "<td class='num'>" + r.completed_last_hour + "</td>" +
+              "<td class='num'>" + r.failed_last_hour + "</td></tr>"
+            );
+          },
+        );
+
+        document.getElementById("workers").innerHTML = table(
+          [{ label: "Worker" }, { label: "Runs / 5m", cls: "num" }, { label: "Now" }],
+          s.workers,
+          (r) =>
+            "<tr><td class='mono'>" + esc(r.worker_id) + "</td>" +
+            "<td class='num'>" + r.executions_last_5m + "</td>" +
+            "<td class='mono'>" +
+              (r.current_job_id
+                ? "#" + r.current_job_id + " " + esc(r.current_job_type)
+                : "<span class='cap'>idle</span>") +
+            "</td></tr>",
+        );
+
+        document.getElementById("recurring").innerHTML = table(
+          [{ label: "Name" }, { label: "Cron", cls: "mono" }, { label: "Next" }],
+          s.recurring,
+          (r) =>
+            "<tr><td class='mono'>" + esc(r.name) +
+              (r.enabled ? "" : " <span class='pill'>off</span>") + "</td>" +
+            "<td class='mono'>" + esc(r.cron_expression) + " <span class='cap'>" +
+              esc(r.timezone) + "</span></td>" +
+            "<td class='mono'>" + esc(new Date(r.next_run_at).toLocaleString()) + "</td></tr>",
+        );
+
+        document.getElementById("failures").innerHTML = table(
+          [{ label: "Job", cls: "num" }, { label: "Type" }, { label: "Attempts", cls: "num" },
+           { label: "Error" }, { label: "Died" }],
+          s.recentFailures,
+          (r) =>
+            "<tr><td class='num'>#" + r.job_id + "</td>" +
+            "<td class='mono'>" + esc(r.type) + "</td>" +
+            "<td class='num'>" + r.attempts + "</td>" +
+            "<td class='err' title='" + esc(r.final_error) + "'>" + esc(r.final_error) + "</td>" +
+            "<td class='mono'>" + esc(ago(r.died_at)) + "</td></tr>",
+        );
+
+        document.getElementById("executions").innerHTML = table(
+          [{ label: "Job", cls: "num" }, { label: "Type" }, { label: "Attempt", cls: "num" },
+           { label: "Worker" }, { label: "Status" }, { label: "Started" }],
+          s.recentExecutions,
+          (r) =>
+            "<tr><td class='num'>#" + r.job_id + "</td>" +
+            "<td class='mono'>" + esc(r.type) + "</td>" +
+            "<td class='num'>" + r.attempts + "</td>" +
+            "<td class='mono'>" + esc(r.worker_id) + "</td>" +
+            "<td><span class='pill " + esc(r.status) + "'>" + esc(r.status) + "</span></td>" +
+            "<td class='mono'>" + esc(ago(r.started_at)) + "</td></tr>",
+        );
+      }
+
+      async function poll() {
+        const errBox = document.getElementById("error");
+        try {
+          const res = await fetch("/api/stats", { cache: "no-store" });
+          if (!res.ok) throw new Error("HTTP " + res.status);
+          render(await res.json());
+          errBox.style.display = "none";
+        } catch (err) {
+          // Keep the last good snapshot on screen rather than blanking the page.
+          errBox.textContent = "stats unavailable: " + err.message;
+          errBox.style.display = "block";
+        } finally {
+          setTimeout(poll, POLL_MS);
+        }
+      }
+
+      poll();
+    </script>
+  </body>
+</html>

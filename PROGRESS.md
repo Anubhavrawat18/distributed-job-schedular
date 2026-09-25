@@ -653,3 +653,98 @@ a retention policy plus a cleanup job. Crash recovery is still missing entirely:
 a worker killed mid-execution leaves its job `running` with nothing to reclaim
 it, so the retry path this phase protects never even triggers. That is Phase 8,
 and it is what makes this phase's guarantee actually reachable.
+
+---
+
+## Phase 7 — Observability
+
+**What:** A `GET /api/stats` endpoint returning a single snapshot of queue
+health, and a dashboard at `/` that polls it every 2 seconds. Plain static HTML
+and vanilla JS — no framework, no build step. Adds four indexes that exist
+solely to keep the read path cheap.
+
+**Purpose:** Everything so far is invisible. The queue could be healthy, falling
+behind, or quietly dead-lettering every job of one type, and the only way to
+find out was to write SQL. This phase makes the system's state legible at a
+glance.
+
+Notably, it required almost no new *data*. The earlier phases had already
+produced everything worth showing: `job_executions` gives per-attempt history
+and per-worker activity, `dead_letter_jobs` gives failures with the error that
+killed them, `worker_id` gives the fleet view, `job_type_limits` gives live
+running counts against caps. Observability was mostly a question of asking the
+right questions of data that already existed.
+
+**How it works:**
+
+- **Backlog age is the headline metric, not queue depth.** The largest tile is
+  "oldest waiting": how long the oldest *due but unclaimed* job has been
+  waiting. Depth alone is close to useless as a health signal — 10,000 pending
+  jobs that are being drained is a healthy busy system, while 5 pending jobs
+  untouched for nine minutes means nothing is claiming them and something is
+  broken. Depth measures size; backlog age measures whether the fleet is keeping
+  up. It drives the tile's colour: green under 10s, amber under 60s, red beyond.
+
+- **"Retrying now" is a leading indicator.** Jobs that have burned an attempt
+  and are waiting out their backoff. This rises *before* anything dead-letters,
+  so it is the number that warns a dependency is degrading while there is still
+  time to act. The dead-letter count is the lagging equivalent — by then the work
+  is already lost.
+
+- **Workers are observed, not registered.** A worker appears in the fleet view
+  because it has executed something in the last five minutes, not because it
+  checked in to a heartbeat table. That keeps workers stateless — nothing to
+  register, nothing to clean up when one dies — at the cost of an idle worker
+  looking absent. Phase 8 adds leases, which is the point at which a real
+  heartbeat starts to earn its keep.
+
+- **Every query is bounded.** The dashboard polls, so its queries run orders of
+  magnitude more often than any single job is claimed. Each one is constrained
+  by a time window, a `LIMIT`, or an indexed grouping, and all seven are issued
+  with `Promise.all` so a refresh costs one round trip rather than seven. Four
+  indexes were added specifically for this read path; without them the
+  time-window queries are sequential scans over the two tables that grow forever,
+  and the dashboard would gradually become the thing starving the workers it
+  exists to watch.
+
+- **JSON endpoint rather than server-rendered HTML**, so the same data is usable
+  from a terminal or a monitoring check, and the page is just another client of
+  the API.
+
+**Verified in a browser, not only typechecked:**
+
+| Check | Result |
+|---|---|
+| Snapshot latency, 2,250 jobs / 2,411 executions | **7–21ms** |
+| Live polling | `updated` timestamp advances unattended |
+| Concurrency cap visible | `sleep` showing 3 running against cap 3, 21 queued |
+| API stopped mid-session | banner shown, **last snapshot retained** rather than blanking |
+| API restarted | recovered automatically, no reload |
+
+The failure behaviour was tested by actually stopping the API rather than by
+reading the code: a dashboard that blanks the moment the backend hiccups is
+worse than useless during an incident, which is exactly when it blanks.
+
+**Note on the dev database:** ~185 disabled recurring definitions left over from
+the Phase 4–6 test runs (`race-*`, `test-every-minute-*`) were deleted, since
+they crowded the schedules panel out of usefulness. Only test artifacts were
+removed.
+
+**Running it:**
+
+```bash
+docker compose up -d --build --scale worker=5
+npm run db:init
+npm run dev:api
+# then open http://localhost:3000/
+```
+
+```bash
+curl -s localhost:3000/api/stats | jq .health
+```
+
+**Still open:** the dashboard is read-only — no requeue of a dead-lettered job,
+no pause, no cap editing, though the endpoints for some of that already exist.
+Metrics are instantaneous rather than historical, so there are no trends: "is
+throughput falling?" needs a time series, which needs retention and rollups.
+There is also no auth, which is fine on localhost and not fine anywhere else.

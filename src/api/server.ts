@@ -1,9 +1,11 @@
+import { join } from "path";
 import express, { type ErrorRequestHandler } from "express";
 import { config } from "../config";
 import { pool } from "../db/client";
 import { jobsRouter } from "./routes/jobs";
 import { recurringJobsRouter } from "./routes/recurringJobs";
 import { jobTypeLimitsRouter } from "./routes/jobTypeLimits";
+import { statsRouter } from "./routes/stats";
 
 const app = express();
 
@@ -25,6 +27,11 @@ app.get("/health", async (_req, res) => {
 app.use(jobsRouter);
 app.use(recurringJobsRouter);
 app.use(jobTypeLimitsRouter);
+app.use(statsRouter);
+
+// The dashboard is plain static HTML that polls /api/stats. No build step and no
+// framework, so there is nothing to compile and the page is readable as-is.
+app.use(express.static(join(__dirname, "../../dashboard")));
 
 const errorHandler: ErrorRequestHandler = (err, _req, res, _next) => {
   console.error("[api] unhandled error", err);
