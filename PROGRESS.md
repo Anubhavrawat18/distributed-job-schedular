@@ -748,3 +748,114 @@ no pause, no cap editing, though the endpoints for some of that already exist.
 Metrics are instantaneous rather than historical, so there are no trends: "is
 throughput falling?" needs a time series, which needs retention and rollups.
 There is also no auth, which is fine on localhost and not fine anywhere else.
+
+---
+
+## Phase 8 — Graceful shutdown and crash recovery
+
+**What:** Claims are now leases with an expiry. Workers heartbeat to extend the
+lease they hold; a reaper — running inside every worker — returns jobs whose
+lease has lapsed to the queue. `SIGTERM` stops claiming immediately, gives the
+in-flight job a grace period, and hands it back explicitly if it does not
+finish. Terminal writes are ownership-guarded so a stalled worker cannot clobber
+a job that has been reassigned.
+
+**Purpose:** Closes the gap that has been open since Phase 2, and it is a bigger
+one than it looks. A worker that died holding a job left that row in `running`
+forever, because the claim query only ever looks at `pending`. Everything built
+since — retries, backoff, the dead-letter queue, idempotent re-execution — was
+therefore *unreachable in the exact case it was designed for*. Phase 6's
+guarantee that a crashed job runs safely a second time meant nothing while the
+crashed job never ran a second time at all.
+
+**How it works:**
+
+- **Two mechanisms, deliberately, because they fail differently.**
+
+  | | Graceful shutdown | Lease expiry |
+  |---|---|---|
+  | Covers | SIGTERM: deploys, scale-down | SIGKILL, OOM, power loss, partition |
+  | Speed | immediate (grace period) | one lease period |
+  | Requires | the process to run code | nothing at all |
+
+  Graceful shutdown is the *optimisation*; the lease is the *guarantee*. Without
+  shutdown handling, every redeploy parks one job per worker for a full lease.
+  Without leases, a `kill -9` strands a job permanently — and in that case not a
+  single line of shutdown code executes. Neither is sufficient alone, and it is
+  worth being explicit that the fast path is the one that requires cooperation.
+
+- **The attempt was already charged at claim time**, a Phase 3 decision that
+  only fully pays off here. It is what bounds recovery: a job that reliably
+  kills its worker gets reclaimed, retried, and eventually dead-lettered rather
+  than cycling through the fleet forever, killing each worker in turn.
+
+- **Reclaimed jobs get backoff, not an instant retry.** A job that just killed a
+  worker is likelier than average to kill the next one.
+
+- **Every worker reaps**, on a timer independent of its claim loop. A dedicated
+  reaper process would give recovery a single point of failure — and the one
+  component whose death strands jobs forever should not be the component whose
+  entire purpose is to un-strand them.
+
+- **Fencing.** No timeout can distinguish "slow" from "dead". If a worker
+  stalls — a long GC pause, a frozen VM — its lease lapses, the reaper reassigns
+  the job, and the stalled worker then wakes up still believing it owns it. The
+  heartbeat's `worker_id = $2` predicate is how it finds out it has been fenced,
+  and the ownership guard on the completion write means its result is discarded
+  rather than overwriting the new owner's. **Leases do not eliminate this race,
+  they bound it**; idempotency (Phase 6) is what makes the overlap harmless. The
+  two phases are halves of one guarantee.
+
+- **`reclaim_count` is separate from `attempts`** so abandonment is
+  distinguishable from ordinary flakiness. A job that keeps being reclaimed is
+  killing workers; a job that keeps failing is merely broken.
+
+**Measured results** (`npm run test:recovery`, which kills real containers):
+
+| Scenario | Result |
+|---|---|
+| `docker kill -s KILL` mid-job | job stranded in `running`, then reclaimed; `reclaim_count=1`, `worker_id` cleared, attempt still charged, completed on another worker |
+| `docker stop` (SIGTERM) mid-job | handed back in **15,256ms** — the configured grace period — against a 30s lease, `reclaim_count=0` proving shutdown did it, not the reaper |
+| 45s job under a 30s lease | lease extended, never lapsed, never reclaimed |
+
+All six suites pass.
+
+**Two bugs found by testing rather than by reading:**
+
+*The reaper's lock did nothing.* The first version ran
+`SELECT ... FOR UPDATE SKIP LOCKED` through `pool.query`, which commits
+immediately and releases the locks before the follow-up `UPDATE` — so the
+"protection" was decorative. Rewritten to hold one transaction across the scan
+and the reclaims.
+
+*The SIGTERM test was racing itself.* It used a blocking `execSync("docker
+stop")`, so the test process was frozen for the entire stop and could not
+observe the brief `pending` window before another worker re-claimed the job. It
+reported 45s and looked like a product bug. The fix was to issue the stop
+asynchronously, poll concurrently, and run that case against a **single**
+worker so the handback is the only thing that can happen. Worth recording
+because the failing output pointed squarely at the wrong component.
+
+Also corrected: `stop_grace_period: 20s` in Compose must exceed
+`SHUTDOWN_GRACE_MS` (15s), or Docker SIGKILLs the worker mid-handback and turns
+a graceful stop into exactly the crash it was avoiding.
+
+**Running it:**
+
+```bash
+docker compose up -d --build --scale worker=5
+npm run db:init
+npm run test:recovery
+```
+
+```bash
+docker kill --signal=KILL distributed-job-schedular-worker-1
+# watch the dashboard: expired leases rises, then Reclaimed increments
+```
+
+**Still open:** the lease period is global rather than per job type, so a job
+type that legitimately runs for ten minutes forces everything to tolerate a
+ten-minute lease. Per-type lease durations, or a handler declaring its expected
+runtime, would fix that. The reaper also scans at most 20 jobs per pass, which
+is ample in normal operation but would recover a large fleet outage gradually
+rather than all at once.

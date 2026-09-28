@@ -44,6 +44,23 @@ export const config = {
     claimStrategy,
     capEnforcement,
 
+    // How long a claim is valid without a heartbeat. Too short and a slow-but-
+    // healthy job gets reclaimed underneath itself; too long and a crashed
+    // worker's job sits stranded for that long. 30s with a 10s heartbeat gives
+    // two missed beats of slack before anything is presumed dead.
+    leaseSeconds: Number(process.env.LEASE_SECONDS ?? 30),
+    heartbeatIntervalMs: Number(process.env.HEARTBEAT_INTERVAL_MS ?? 10_000),
+
+    // How often each worker looks for abandoned jobs. Every worker reaps, so
+    // recovery has no single point of failure — there is no one process whose
+    // death stops jobs being reclaimed.
+    reapIntervalMs: Number(process.env.REAP_INTERVAL_MS ?? 5_000),
+
+    // On SIGTERM, how long to let an in-flight job finish before giving up and
+    // handing it back. Must stay below the orchestrator's own kill timeout
+    // (docker-compose stop_grace_period) or the process is SIGKILLed mid-cleanup.
+    shutdownGraceMs: Number(process.env.SHUTDOWN_GRACE_MS ?? 15_000),
+
     // Starvation control. A job's effective priority rises by 1 for every this
     // many seconds it has been eligible but unclaimed. 0 disables aging, which
     // makes starvation reproducible rather than merely described.

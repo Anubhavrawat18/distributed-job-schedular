@@ -116,12 +116,16 @@ async function claimSkipLocked(workerId: string): Promise<Job | null> {
       return null;
     }
 
+    // The lease starts here. From this instant the worker owes a heartbeat, and
+    // if it stops sending one the job is reclaimable without its cooperation.
     const { rows } = await client.query<Job>(
       `UPDATE jobs
-       SET status = 'running', worker_id = $1, attempts = attempts + 1, updated_at = now()
+       SET status = 'running', worker_id = $1, attempts = attempts + 1,
+           lease_expires_at = now() + make_interval(secs => $3::double precision),
+           updated_at = now()
        WHERE id = $2
        RETURNING *`,
-      [workerId, id],
+      [workerId, id, config.worker.leaseSeconds],
     );
 
     await client.query("COMMIT");
@@ -196,10 +200,12 @@ async function claimNaive(workerId: string): Promise<Job | null> {
   // claimed more than once.
   const claimed = await pool.query<Job>(
     `UPDATE jobs
-     SET status = 'running', worker_id = $1, attempts = attempts + 1, updated_at = now()
+     SET status = 'running', worker_id = $1, attempts = attempts + 1,
+         lease_expires_at = now() + make_interval(secs => $3::double precision),
+         updated_at = now()
      WHERE id = $2
      RETURNING *`,
-    [workerId, pending.rows[0].id],
+    [workerId, pending.rows[0].id, config.worker.leaseSeconds],
   );
 
   return claimed.rows[0] ?? null;

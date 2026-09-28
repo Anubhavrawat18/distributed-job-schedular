@@ -224,6 +224,10 @@
             sub: "waiting on backoff" },
           { label: "Dead-lettered", value: h.deadLetterTotal, cls: h.deadLetterTotal > 0 ? "bad" : "",
             sub: "+" + h.failedLastMinute + " failed last min" },
+          // Expired leases should sit at 0: a non-zero value that persists means
+          // reaping is not keeping up, or every worker that could reap is dead.
+          { label: "Reclaimed", value: h.reclaimedTotal, cls: h.expiredLeases > 0 ? "warn" : "",
+            sub: h.expiredLeases + " lease(s) expired now" },
         ]
           .map(
             (t) =>

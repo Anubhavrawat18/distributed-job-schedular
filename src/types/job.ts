@@ -15,6 +15,8 @@ export interface Job {
     scheduled_for: string | null;
     priority: number;
     idempotency_key: string | null;
+    lease_expires_at: string | null;
+    reclaim_count: number;
     created_at: string;
     updated_at: string;
 }

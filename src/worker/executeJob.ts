@@ -104,7 +104,11 @@ export async function executeJob(job: Job, workerId: string): Promise<void> {
   // An unknown job type is not a transient fault — retrying cannot make a
   // handler appear — so it skips the backoff path and dead-letters immediately.
   if (!handler) {
-    await deadLetter(job, `no handler registered for job type "${job.type}"`);
+    await deadLetter(
+      job,
+      `no handler registered for job type "${job.type}"`,
+      workerId,
+    );
     return;
   }
 
@@ -116,18 +120,29 @@ export async function executeJob(job: Job, workerId: string): Promise<void> {
       idempotent: (name, fn) =>
         withIdempotency(`job:${job.id}:${name}`, job.id, fn),
     });
-    await pool.query(
+    // `worker_id = $3` fences a worker that stalled long enough to lose its
+    // lease: if the reaper handed this job to someone else, this update matches
+    // no rows instead of overwriting the new owner's outcome.
+    const { rowCount } = await pool.query(
       `UPDATE jobs
-             SET status = 'completed', result = $2, error = NULL, updated_at = now()
-             WHERE id = $1`,
-      [job.id, result],
+             SET status = 'completed', result = $2, error = NULL,
+                 lease_expires_at = NULL, updated_at = now()
+             WHERE id = $1 AND worker_id = $3`,
+      [job.id, result, workerId],
     );
+
+    if (rowCount === 0) {
+      console.warn(
+        `[worker ${workerId}] finished job ${job.id} but no longer owns it; discarding the result`,
+      );
+      return;
+    }
     console.log(
       `[worker] job ${job.id} (${job.type}) completed on attempt ${job.attempts}`,
     );
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    await handleFailure(job, message);
+    await handleFailure(job, message, workerId);
   }
 }
 
@@ -135,9 +150,13 @@ export async function executeJob(job: Job, workerId: string): Promise<void> {
  * Retry budget check. `attempts` was already incremented at claim time, so it
  * reflects the attempt that just failed.
  */
-async function handleFailure(job: Job, error: string): Promise<void> {
+async function handleFailure(
+  job: Job,
+  error: string,
+  workerId: string,
+): Promise<void> {
   if (job.attempts >= job.max_attempts) {
-    await deadLetter(job, error);
+    await deadLetter(job, error, workerId);
     return;
   }
 
@@ -152,11 +171,13 @@ async function handleFailure(job: Job, error: string): Promise<void> {
   await pool.query(
     `UPDATE jobs
      SET status = 'pending',
+         worker_id = NULL,
+         lease_expires_at = NULL,
          error = $2,
          next_run_at = now() + make_interval(secs => $3::double precision),
          updated_at = now()
-     WHERE id = $1`,
-    [job.id, error, delayMs / 1000],
+     WHERE id = $1 AND worker_id = $4`,
+    [job.id, error, delayMs / 1000, workerId],
   );
 
   console.warn(
@@ -169,12 +190,16 @@ async function handleFailure(job: Job, error: string): Promise<void> {
  * dead_letter_jobs row recording why it died — the job is not moved, so its
  * job_executions history stays intact for investigation.
  */
-async function deadLetter(job: Job, error: string): Promise<void> {
+async function deadLetter(
+  job: Job,
+  error: string,
+  workerId: string,
+): Promise<void> {
   await pool.query(
     `UPDATE jobs
-     SET status = 'failed', error = $2, updated_at = now()
-     WHERE id = $1`,
-    [job.id, error],
+     SET status = 'failed', error = $2, lease_expires_at = NULL, updated_at = now()
+     WHERE id = $1 AND worker_id = $3`,
+    [job.id, error, workerId],
   );
 
   // ON CONFLICT: a job can only die once, but a duplicate claim under the naive

@@ -33,9 +33,16 @@ services:
       PRIORITY_AGING_SECONDS: ${PRIORITY_AGING_SECONDS:-60}
       CAP_ENFORCEMENT: ${CAP_ENFORCEMENT:-exact}
       IDEMPOTENCY: ${IDEMPOTENCY:-enforced}
+      LEASE_SECONDS: ${LEASE_SECONDS:-30}
+      HEARTBEAT_INTERVAL_MS: ${HEARTBEAT_INTERVAL_MS:-10000}
+      REAP_INTERVAL_MS: ${REAP_INTERVAL_MS:-5000}
+      SHUTDOWN_GRACE_MS: ${SHUTDOWN_GRACE_MS:-15000}
       RETRY_MAX_ATTEMPTS: ${RETRY_MAX_ATTEMPTS:-3}
       RETRY_BASE_MS: ${RETRY_BASE_MS:-1000}
       RETRY_MAX_MS: ${RETRY_MAX_MS:-30000}
+    # Must exceed SHUTDOWN_GRACE_MS, or Compose SIGKILLs the worker while it is
+    # still handing its job back — turning a graceful stop into a crash.
+    stop_grace_period: 20s
 
   # Safe to scale: definitions are claimed with FOR UPDATE SKIP LOCKED and a
   # unique index on (recurring_job_id, scheduled_for) backstops it.

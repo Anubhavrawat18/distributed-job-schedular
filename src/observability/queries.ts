@@ -37,6 +37,11 @@ interface Health {
   failedLastMinute: number;
   retryingNow: number;
   deadLetterTotal: number;
+
+  /** Running jobs whose lease has lapsed — awaiting reclaim. Should hover at 0. */
+  expiredLeases: number;
+  /** Jobs ever taken back from a dead worker. */
+  reclaimedTotal: number;
 }
 
 interface TypeRow {
@@ -137,7 +142,13 @@ async function getHealth(): Promise<Health> {
        (SELECT count(*) FROM jobs
           WHERE status = 'pending' AND attempts > 0 AND next_run_at > now())::text
          AS retrying_now,
-       (SELECT count(*) FROM dead_letter_jobs)::text AS dead_letter_total`,
+       (SELECT count(*) FROM dead_letter_jobs)::text AS dead_letter_total,
+       -- Persistently above zero means reaping is not keeping up, or every
+       -- worker that could reap is itself dead.
+       (SELECT count(*) FROM jobs
+          WHERE status = 'running' AND lease_expires_at < now())::text
+         AS expired_leases,
+       (SELECT count(*) FROM jobs WHERE reclaim_count > 0)::text AS reclaimed_total`,
   );
 
   const r = rows[0];
@@ -151,6 +162,8 @@ async function getHealth(): Promise<Health> {
     failedLastMinute: Number(r.failed_last_minute),
     retryingNow: Number(r.retrying_now),
     deadLetterTotal: Number(r.dead_letter_total),
+    expiredLeases: Number(r.expired_leases),
+    reclaimedTotal: Number(r.reclaimed_total),
   };
 }
 
